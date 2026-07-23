@@ -14,6 +14,14 @@ architecture. PostgreSQL is supported via the standard `pg_dump` /
   dbsnap shells out to these rather than reimplementing dump/restore
   logic itself.
 
+  **Version compatibility:** `pg_dump` must be **at least as new as the
+  server** it backs up — it refuses to dump a newer server and fails with
+  `server version: X; pg_dump version: Y`. It *is* backward compatible, so
+  a newer client dumps older servers fine. When in doubt, install the
+  newest `pg_dump` you'll need across all your servers. (The Docker image
+  pins version 18 for exactly this reason — see
+  [docs/ugreen-nas.md](docs/ugreen-nas.md).)
+
   Check whether you already have them:
 
   ```sh
@@ -52,6 +60,11 @@ architecture. PostgreSQL is supported via the standard `pg_dump` /
   # installs the client tools (pulls in pg_dump/pg_restore/psql)
   sudo pacman -S postgresql-libs
   ```
+
+  **UGREEN NAS (UGOS)**
+
+  UGOS doesn't have a standard package manager — see
+  [docs/ugreen-nas.md](docs/ugreen-nas.md) for a Docker-based setup.
 
 ## Build
 
