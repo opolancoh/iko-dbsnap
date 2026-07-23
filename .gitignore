@@ -1,0 +1,24 @@
+/bin/
+
+# default backup output directory — real database dumps land here and
+# must never be committed (potentially sensitive/PII data)
+/backups/
+
+# machine/session-specific Claude Code permissions, not shared project config
+.claude/settings.local.json
+
+# secrets, if a .env file ever gets added for local config
+.env
+.env.local
+
+# macOS Finder metadata
+.DS_Store
+
+# editor/IDE local config
+.vscode/
+.idea/
+
+# Go test/coverage artifacts
+*.test
+coverage.out
+*.prof
