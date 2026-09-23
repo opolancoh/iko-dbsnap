@@ -3,47 +3,37 @@ package tui
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 
-	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/spinner"
+	tea "github.com/charmbracelet/bubbletea"
 
 	"iko-dbsnap/core"
 )
 
-// RestoreConfig configures one interactive restore run. Targets carry the
-// caller's intent (which database, from which file, with which
-// no-owner/format options) but never opts.Create — the flow decides per
-// target, via core.DecideRestorePlan, whether creating the database is
-// safe.
+// RestoreConfig configures one interactive restore run. The pre-flight
+// checks (core.PlanRestore) have already run by the time this is built:
+// Conn.DBName is the resolved target, known not to exist yet.
 type RestoreConfig struct {
 	Provider    core.Provider
-	Targets     []core.RestoreTarget
-	Concurrency int
+	Conn        core.ConnectionInfo
+	Opts        core.RestoreOptions
+	Plan        core.RestorePlan
 	AutoConfirm bool
 }
 
-// RunRestore drives the interactive restore flow: connect, check each
-// backup file and what it knows about its own original database, check
-// which target databases already exist, confirm, restore, summarize.
+// RunRestore drives the interactive restore flow: show the plan, confirm,
+// create the database and restore into it, then verify and summarize.
 func RunRestore(parent context.Context, cfg RestoreConfig) error {
-	if len(cfg.Targets) == 0 {
-		return fmt.Errorf("tui: no targets given")
-	}
 	insp, ok := cfg.Provider.(core.Inspector)
 	if !ok {
 		return fmt.Errorf("tui: provider %q does not support interactive discovery", cfg.Provider.Name())
-	}
-	archInsp, ok := cfg.Provider.(core.ArchiveInspector)
-	if !ok {
-		return fmt.Errorf("tui: provider %q does not support archive inspection", cfg.Provider.Name())
 	}
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	m := newRestoreModel(ctx, cfg, insp, archInsp)
+	m := newRestoreModel(ctx, cfg, insp)
 	m.cancel = cancel
 	program := tea.NewProgram(m)
 	m.program = program
@@ -55,12 +45,12 @@ func RunRestore(parent context.Context, cfg RestoreConfig) error {
 	fm := final.(*restoreModel)
 
 	switch {
-	case fm.fatalErr != nil:
-		return fm.fatalErr
-	case fm.userAborted:
+	case fm.userAborted && fm.stage == rstageReport:
 		return ErrAborted
-	case fm.failedCount > 0:
-		return fmt.Errorf("%d of %d database restore(s) failed", fm.failedCount, fm.attemptedCount)
+	case fm.userAborted:
+		return fmt.Errorf("aborted mid-restore — database %q may have been created and partially restored; drop it before retrying", cfg.Conn.DBName)
+	case !fm.result.OK():
+		return fmt.Errorf("restore of %q failed", cfg.Conn.DBName)
 	}
 	return nil
 }
@@ -68,214 +58,82 @@ func RunRestore(parent context.Context, cfg RestoreConfig) error {
 type restoreStage int
 
 const (
-	rstagePinging restoreStage = iota
-	rstageDiscovering
-	rstageReport
+	rstageReport restoreStage = iota
 	rstageRestoring
+	rstageVerifying
 	rstageDone
 )
-
-type restoreDBState struct {
-	conn core.ConnectionInfo
-	opts core.RestoreOptions
-	name string
-
-	archiveInfo core.ArchiveInfo
-	archiveErr  error
-
-	exists bool
-	plan   core.RestorePlan // valid once both archive check and db list are in
-
-	restoring bool
-	current   string
-	done      bool
-	result    core.RestoreResult
-
-	// verifying/postInsp/postInspErr cover the post-restore verification
-	// step: after a successful restore, we query the target database's
-	// actual schema/table/row-count shape directly, rather than just
-	// trusting pg_restore's exit code — unlike backup, restore's target
-	// is a live database we already have full access to, so there's no
-	// need to settle for an unverified "it said it worked."
-	verifying   bool
-	postInsp    core.DatabaseInspection
-	postInspErr error
-}
-
-// blocked reports whether this target can't proceed at all (bad or
-// unreadable backup file).
-func (d *restoreDBState) blocked() bool {
-	return d.archiveErr != nil
-}
 
 type restoreModel struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	cfg     RestoreConfig
 	insp    core.Inspector
-	arch    core.ArchiveInspector
 	program *tea.Program
 	spinner spinner.Model
 
 	stage       restoreStage
-	fatalErr    error
 	userAborted bool
 
-	dbs []*restoreDBState
+	current string
+	result  core.RestoreResult
 
-	archivePending int
-	dbListDone     bool
-	existingDBs    map[string]bool
-
-	restorePending int
-	attemptedCount int
-	failedCount    int
+	// postInsp/postInspErr cover the post-restore verification step:
+	// after a successful restore, we query the new database's actual
+	// schema/table/row-count shape directly, rather than just trusting
+	// pg_restore's exit code — unlike backup, restore's target is a live
+	// database we already have full access to, so there's no need to
+	// settle for an unverified "it said it worked."
+	postInsp    core.DatabaseInspection
+	postInspErr error
 }
 
-func newRestoreModel(ctx context.Context, cfg RestoreConfig, insp core.Inspector, arch core.ArchiveInspector) *restoreModel {
-	m := &restoreModel{
+func newRestoreModel(ctx context.Context, cfg RestoreConfig, insp core.Inspector) *restoreModel {
+	return &restoreModel{
 		ctx:     ctx,
 		cfg:     cfg,
 		insp:    insp,
-		arch:    arch,
 		spinner: spinner.New(spinner.WithSpinner(spinner.Dot)),
 	}
-	for _, t := range cfg.Targets {
-		m.dbs = append(m.dbs, &restoreDBState{conn: t.Conn, opts: t.Opts, name: t.Conn.DBName})
-	}
-	return m
 }
 
 // --- messages ---
 
-type rPingMsg struct{ err error }
-type rDBListMsg struct {
-	names []string
-	err   error
-}
-type rArchiveMsg struct {
-	index int
-	info  core.ArchiveInfo
-	err   error
-}
-type rRestoreDoneMsg struct {
-	index int
-	res   core.RestoreResult
-}
+type rRestoreDoneMsg struct{ res core.RestoreResult }
 type rVerifyMsg struct {
-	index int
-	insp  core.DatabaseInspection
-	err   error
+	insp core.DatabaseInspection
+	err  error
 }
 type rProgressMsg core.ProgressEvent
 
 // --- init / commands ---
 
 func (m *restoreModel) Init() tea.Cmd {
-	return tea.Batch(m.spinner.Tick, m.pingCmd())
-}
-
-func (m *restoreModel) pingCmd() tea.Cmd {
-	conn := m.dbs[0].conn
-	return func() tea.Msg {
-		return rPingMsg{err: m.insp.Ping(m.ctx, conn)}
-	}
-}
-
-func (m *restoreModel) listCmd() tea.Cmd {
-	conn := m.dbs[0].conn
-	return func() tea.Msg {
-		names, err := m.insp.ListDatabases(m.ctx, conn)
-		return rDBListMsg{names: names, err: err}
-	}
-}
-
-func (m *restoreModel) archiveCmd(index int, d *restoreDBState) tea.Cmd {
-	path := d.opts.InputPath
-	return func() tea.Msg {
-		if stat, err := os.Stat(path); err != nil {
-			return rArchiveMsg{index: index, err: fmt.Errorf("cannot read backup at %q: %w", path, err)}
-		} else if stat.Size() == 0 && !stat.IsDir() {
-			return rArchiveMsg{index: index, err: fmt.Errorf("backup at %q is empty", path)}
-		}
-		info, err := m.arch.InspectArchive(m.ctx, path)
-		return rArchiveMsg{index: index, info: info, err: err}
-	}
-}
-
-func (m *restoreModel) verifyCmd(index int, conn core.ConnectionInfo) tea.Cmd {
-	return func() tea.Msg {
-		insp, err := m.insp.Inspect(m.ctx, conn)
-		return rVerifyMsg{index: index, insp: insp, err: err}
-	}
-}
-
-func (m *restoreModel) startArchiveChecks() tea.Cmd {
-	m.archivePending = len(m.dbs)
-	cmds := make([]tea.Cmd, 0, len(m.dbs)+1)
-	for i, d := range m.dbs {
-		cmds = append(cmds, m.archiveCmd(i, d))
-	}
-	cmds = append(cmds, m.listCmd())
-	return tea.Batch(cmds...)
-}
-
-// maybeAdvanceToReport moves past rstageDiscovering once both the server's
-// database list and every target's archive check have come back.
-func (m *restoreModel) maybeAdvanceToReport() (tea.Model, tea.Cmd) {
-	if m.archivePending > 0 || !m.dbListDone {
-		return m, nil
-	}
-	anyRunnable := false
-	for _, d := range m.dbs {
-		if d.archiveErr == nil {
-			d.exists = m.existingDBs[d.name]
-			d.plan = core.DecideRestorePlan(d.name, d.exists)
-			anyRunnable = true
-		}
-	}
-	if !anyRunnable {
-		m.fatalErr = fmt.Errorf("none of the requested restores can proceed — see the report above")
-		m.stage = rstageReport
-		return m, tea.Quit
-	}
 	if m.cfg.AutoConfirm {
-		return m, m.startRestores()
+		return tea.Batch(m.spinner.Tick, m.startRestore())
 	}
-	m.stage = rstageReport
-	return m, nil
+	return m.spinner.Tick
 }
 
-func (m *restoreModel) startRestores() tea.Cmd {
+func (m *restoreModel) startRestore() tea.Cmd {
 	m.stage = rstageRestoring
-
-	var targets []core.RestoreTarget
-	var indices []int
-	for i, d := range m.dbs {
-		if d.blocked() {
-			continue
-		}
-		d.restoring = true
-		m.restorePending++
-		opts := d.opts
-		opts.Create = d.plan == core.RestorePlanCreate
-		opts.OnProgress = func(ev core.ProgressEvent) {
-			m.program.Send(rProgressMsg(ev))
-		}
-		targets = append(targets, core.RestoreTarget{Conn: d.conn, Opts: opts})
-		indices = append(indices, i)
+	opts := m.cfg.Opts
+	opts.OnProgress = func(ev core.ProgressEvent) {
+		m.program.Send(rProgressMsg(ev))
 	}
-	if len(targets) == 0 {
-		m.stage = rstageDone
-		return tea.Quit
-	}
-
-	concurrency := m.cfg.Concurrency
 	return func() tea.Msg {
-		core.RestoreAllWithProgress(m.ctx, m.cfg.Provider, targets, concurrency, func(i int, res core.RestoreResult) {
-			m.program.Send(rRestoreDoneMsg{index: indices[i], res: res})
-		})
-		return nil
+		res, err := m.cfg.Provider.Restore(m.ctx, m.cfg.Conn, opts)
+		if err != nil && res.Err == nil {
+			res.Err = err
+		}
+		return rRestoreDoneMsg{res: res}
+	}
+}
+
+func (m *restoreModel) verifyCmd() tea.Cmd {
+	return func() tea.Msg {
+		insp, err := m.insp.Inspect(m.ctx, m.cfg.Conn)
+		return rVerifyMsg{insp: insp, err: err}
 	}
 }
 
@@ -291,70 +149,24 @@ func (m *restoreModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 
-	case rPingMsg:
-		if msg.err != nil {
-			m.fatalErr = fmt.Errorf("cannot connect to %s:%d: %w", m.dbs[0].conn.Host, portOf(m.dbs[0].conn), msg.err)
-			return m, tea.Quit
-		}
-		m.stage = rstageDiscovering
-		return m, m.startArchiveChecks()
-
-	case rDBListMsg:
-		if msg.err != nil {
-			m.fatalErr = fmt.Errorf("listing databases: %w", msg.err)
-			return m, tea.Quit
-		}
-		m.existingDBs = make(map[string]bool, len(msg.names))
-		for _, n := range msg.names {
-			m.existingDBs[n] = true
-		}
-		m.dbListDone = true
-		return m.maybeAdvanceToReport()
-
-	case rArchiveMsg:
-		d := m.dbs[msg.index]
-		d.archiveInfo = msg.info
-		d.archiveErr = msg.err
-		m.archivePending--
-		return m.maybeAdvanceToReport()
-
 	case rProgressMsg:
-		for _, d := range m.dbs {
-			if d.conn.DBName == msg.DBName && d.restoring {
-				d.current = joinSchemaTable(msg.Schema, msg.Table)
-			}
-		}
+		m.current = joinSchemaTable(msg.Schema, msg.Table)
 		return m, nil
 
 	case rRestoreDoneMsg:
-		d := m.dbs[msg.index]
-		d.restoring = false
-		d.done = true
-		d.result = msg.res
-		m.attemptedCount++
+		m.result = msg.res
 		if !msg.res.OK() {
-			m.failedCount++
-			m.restorePending--
-			if m.restorePending == 0 {
-				m.stage = rstageDone
-				return m, tea.Quit
-			}
-			return m, nil
-		}
-		d.verifying = true
-		return m, m.verifyCmd(msg.index, d.conn)
-
-	case rVerifyMsg:
-		d := m.dbs[msg.index]
-		d.verifying = false
-		d.postInsp = msg.insp
-		d.postInspErr = msg.err
-		m.restorePending--
-		if m.restorePending == 0 {
 			m.stage = rstageDone
 			return m, tea.Quit
 		}
-		return m, nil
+		m.stage = rstageVerifying
+		return m, m.verifyCmd()
+
+	case rVerifyMsg:
+		m.postInsp = msg.insp
+		m.postInspErr = msg.err
+		m.stage = rstageDone
+		return m, tea.Quit
 	}
 	return m, nil
 }
@@ -369,7 +181,7 @@ func (m *restoreModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.stage == rstageReport {
 		switch key {
 		case "y", "Y", "enter":
-			return m, m.startRestores()
+			return m, m.startRestore()
 		case "n", "N", "esc", "q":
 			m.userAborted = true
 			m.cancel()
@@ -382,135 +194,80 @@ func (m *restoreModel) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // --- view ---
 
 func (m *restoreModel) View() string {
-	// Checked first, regardless of stage: a fatal error can be set while
-	// still "in" an earlier stage (e.g. discovery finishes with nothing
-	// runnable), and the reader needs to see why, not a frozen spinner.
-	if m.fatalErr != nil && m.stage != rstageReport {
-		return styleFail.Render("Error: "+m.fatalErr.Error()) + "\n"
-	}
-
 	switch m.stage {
-	case rstagePinging:
-		return fmt.Sprintf("%s Connecting to %s...\n", m.spinner.View(), connLabel(m.dbs[0].conn))
-	case rstageDiscovering:
-		return m.renderTarget() + fmt.Sprintf("%s Reading backup files and checking target databases...\n", m.spinner.View())
 	case rstageReport:
-		if m.fatalErr != nil {
-			return m.renderTarget() + m.renderReport() + "\n" + styleFail.Render(m.fatalErr.Error()) + "\n"
+		if m.userAborted {
+			return m.renderTarget() + m.renderReport() + "\nAborted — nothing was created or restored.\n"
 		}
 		return m.renderTarget() + m.renderReport() + "\n" + styleBold.Render("Continue with restore? [y/N] ")
 	case rstageRestoring:
-		return m.renderTarget() + m.renderReport() + "\n" + m.renderProgress()
+		cur := m.current
+		if cur == "" {
+			cur = "starting..."
+		}
+		return m.renderTarget() + m.renderReport() + fmt.Sprintf("\n%s Restoring %s — %s\n", m.spinner.View(), m.cfg.Conn.DBName, cur)
+	case rstageVerifying:
+		return m.renderTarget() + m.renderReport() + fmt.Sprintf("\n%s Verifying %s...\n", m.spinner.View(), m.cfg.Conn.DBName)
 	case rstageDone:
-		return m.renderTarget() + m.renderSummary()
+		return m.renderTarget() + m.renderReport() + "\n" + m.renderSummary()
 	}
 	return ""
 }
 
 // renderTarget shows which server and user this restore is running
 // against — restoring into the wrong server is a much costlier mistake
-// than backing up the wrong one, so this stays visible on every screen
-// past the initial connect, not just while connecting.
+// than backing up the wrong one, so this stays visible on every screen.
 func (m *restoreModel) renderTarget() string {
-	return styleDim.Render("Target server: "+connLabel(m.dbs[0].conn)) + "\n\n"
+	return styleDim.Render("Target server: "+connLabel(m.cfg.Conn)) + "\n\n"
 }
 
 func (m *restoreModel) renderReport() string {
 	var b strings.Builder
+	name := m.cfg.Conn.DBName
 	b.WriteString(styleBold.Render("Restore plan") + "\n")
-	for _, d := range m.dbs {
-		switch {
-		case d.archiveErr != nil:
-			b.WriteString("  " + styleFail.Render(fmt.Sprintf("✗ %s — %v", d.name, d.archiveErr)) + "\n")
-		case d.plan == core.RestorePlanCreate:
-			note := ""
-			if d.archiveInfo.DBName != "" && d.archiveInfo.DBName != d.name {
-				note = fmt.Sprintf(" (backup was originally database %q)", d.archiveInfo.DBName)
-			}
-			b.WriteString("  " + styleOK.Render(fmt.Sprintf("✓ %s — does not exist, will be created%s", d.name, note)) + "\n")
-		case d.plan == core.RestorePlanIntoExisting:
-			b.WriteString("  " + styleOK.Render(fmt.Sprintf("✓ %s — exists, will restore into it", d.name)) + "\n")
-		}
-		b.WriteString("      " + styleDim.Render("<- "+d.opts.InputPath) + "\n")
+	note := ""
+	switch {
+	case m.cfg.Plan.NameFromArchive:
+		note = " (name taken from the backup — pass -db to choose another)"
+	case m.cfg.Plan.Archive.DBName != "" && m.cfg.Plan.Archive.DBName != name:
+		note = fmt.Sprintf(" (backup was originally database %q)", m.cfg.Plan.Archive.DBName)
 	}
-	return b.String()
-}
-
-func (m *restoreModel) renderProgress() string {
-	var b strings.Builder
-	b.WriteString(styleBold.Render("Restoring") + "\n")
-	for _, d := range m.dbs {
-		if d.blocked() {
-			continue
-		}
-		switch {
-		case d.verifying:
-			b.WriteString(fmt.Sprintf("  %s %s — verifying...\n", m.spinner.View(), d.name))
-		case d.done && d.result.OK():
-			b.WriteString("  " + styleOK.Render(fmt.Sprintf("✓ %s — done in %s", d.name, d.result.Duration.Round(1e6))) + "\n")
-		case d.done:
-			b.WriteString("  " + styleFail.Render(fmt.Sprintf("✗ %s — failed: %v", d.name, d.result.Err)) + "\n")
-		case d.restoring:
-			cur := d.current
-			if cur == "" {
-				cur = "starting..."
-			}
-			b.WriteString(fmt.Sprintf("  %s %s — %s\n", m.spinner.View(), d.name, cur))
-		}
-	}
+	b.WriteString("  " + styleOK.Render(fmt.Sprintf("+ %s — new database, will be created%s", name, note)) + "\n")
+	b.WriteString("      " + styleDim.Render("<- "+m.cfg.Opts.InputPath) + "\n")
 	return b.String()
 }
 
 func (m *restoreModel) renderSummary() string {
-	if m.fatalErr != nil {
-		return styleFail.Render("Error: "+m.fatalErr.Error()) + "\n"
-	}
-	if m.userAborted {
-		return "Aborted — no restores were run.\n"
-	}
-
 	var b strings.Builder
+	name := m.cfg.Conn.DBName
+	dur := m.result.Duration.Round(1e6)
 	b.WriteString(styleBold.Render("Summary") + "\n")
-	var ok, attempted int
-	var totalRows int64
-	for _, d := range m.dbs {
-		if d.blocked() {
-			b.WriteString("  " + styleFail.Render("✗ "+d.name+" — skipped, see plan above") + "\n")
-			continue
-		}
-		attempted++
-		icon, style := "✓", styleOK
-		status := "restored"
-		if !d.result.OK() {
-			icon, style = "✗", styleFail
-			status = "FAILED: " + d.result.Err.Error()
-		} else {
-			ok++
-		}
-		action := "into existing database"
-		if d.plan == core.RestorePlanCreate {
-			action = "into newly created database"
-		}
 
-		if !d.result.OK() {
-			b.WriteString("  " + style.Render(icon) + fmt.Sprintf(" %s — %s, %s (%s)\n", d.name, action, status, d.result.Duration.Round(1e6)))
-			continue
-		}
-		if d.postInspErr != nil {
-			b.WriteString("  " + style.Render(icon) + fmt.Sprintf(" %s — %s, %s (%s)\n", d.name, action, status, d.result.Duration.Round(1e6)))
-			b.WriteString("      " + styleFail.Render("could not verify row counts: "+d.postInspErr.Error()) + "\n")
-			continue
-		}
-		b.WriteString("  " + style.Render(icon) + fmt.Sprintf(" %s — %s, %d schemas, %d tables, %d rows restored (%s)\n",
-			d.name, action, len(d.postInsp.Schemas), d.postInsp.TableCount(), d.postInsp.RowCount(), d.result.Duration.Round(1e6)))
-		for _, s := range d.postInsp.Schemas {
+	if !m.result.OK() {
+		b.WriteString("  " + styleFail.Render(fmt.Sprintf("✗ %s — FAILED (%s): %v", name, dur, m.result.Err)) + "\n")
+		return b.String()
+	}
+
+	if m.postInspErr != nil {
+		b.WriteString("  " + styleOK.Render("✓") + fmt.Sprintf(" %s — restored (%s)\n", name, dur))
+		b.WriteString("      " + styleFail.Render("could not verify row counts: "+m.postInspErr.Error()) + "\n")
+	} else {
+		b.WriteString("  " + styleOK.Render("✓") + fmt.Sprintf(" %s — %d schemas, %d tables, %d rows restored (%s)\n",
+			name, len(m.postInsp.Schemas), m.postInsp.TableCount(), m.postInsp.RowCount(), dur))
+		for _, s := range m.postInsp.Schemas {
 			b.WriteString("      " + styleDim.Render("schema "+s.Name) + "\n")
 			for _, t := range s.Tables {
 				b.WriteString(fmt.Sprintf("        %-40s %10d rows\n", t.Name, t.RowCount))
 			}
 		}
-		totalRows += d.postInsp.RowCount()
 	}
-	b.WriteString(fmt.Sprintf("\nTotal: %d/%d databases restored, %d rows restored\n", ok, attempted, totalRows))
+
+	if len(m.result.Warnings) > 0 {
+		b.WriteString("\n" + styleWarn.Render(fmt.Sprintf("⚠ %d statement(s) failed and were skipped:", len(m.result.Warnings))) + "\n")
+		for _, w := range m.result.Warnings {
+			b.WriteString("  - " + w + "\n")
+		}
+		b.WriteString(styleDim.Render("  Often harmless (e.g. a setting the target server's version doesn't know) — check the list above.") + "\n")
+	}
 	return b.String()
 }

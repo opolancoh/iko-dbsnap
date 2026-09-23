@@ -103,31 +103,3 @@ type ArchiveInspector interface {
 	// without restoring it or connecting to any server.
 	InspectArchive(ctx context.Context, path string) (ArchiveInfo, error)
 }
-
-// RestorePlan is what CheckDatabases is to backup: given whether a
-// restore's target database already exists, it decides how the restore
-// should proceed.
-type RestorePlan int
-
-const (
-	// RestorePlanUnknown is the zero value; DecideRestorePlan never
-	// returns it.
-	RestorePlanUnknown RestorePlan = iota
-	// RestorePlanIntoExisting: the target database already exists —
-	// restore into it as-is.
-	RestorePlanIntoExisting
-	// RestorePlanCreate: the target database doesn't exist yet — create
-	// it under the requested target name (not necessarily the name the
-	// archive was originally dumped from; see ArchiveInfo for that, shown
-	// as an informational note, not a blocker).
-	RestorePlanCreate
-)
-
-// DecideRestorePlan decides how to proceed restoring into targetDB, given
-// whether it already exists.
-func DecideRestorePlan(targetDB string, exists bool) RestorePlan {
-	if exists {
-		return RestorePlanIntoExisting
-	}
-	return RestorePlanCreate
-}

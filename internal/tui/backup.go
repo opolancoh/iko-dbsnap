@@ -360,6 +360,7 @@ var (
 	styleOK   = lipgloss.NewStyle().Foreground(lipgloss.Color("2"))
 	styleFail = lipgloss.NewStyle().Foreground(lipgloss.Color("1"))
 	styleDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	styleWarn = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 )
 
 func (m *model) View() string {

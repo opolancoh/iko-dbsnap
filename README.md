@@ -1,233 +1,214 @@
 # dbsnap
 
-A CLI to back up and restore databases through a pluggable provider
-architecture. PostgreSQL is supported via the standard `pg_dump` /
-`pg_restore` / `psql` client tools.
+A command-line tool to back up and restore databases. It currently
+supports PostgreSQL, using the standard `pg_dump`, `pg_restore` and `psql`
+tools.
 
 ## Requirements
 
-- Go 1.25+ (only needed to build the binary).
-- Network access to the Postgres server you're backing up/restoring, and
-  a user with enough privileges to read the databases involved (and, for
-  discovery, to list databases and read `pg_catalog`).
-- The PostgreSQL client tools on `PATH`: `pg_dump`, `pg_restore`, `psql`.
-  dbsnap shells out to these rather than reimplementing dump/restore
-  logic itself.
+- **Go 1.25+**, only to build the binary.
+- **PostgreSQL client tools** (`pg_dump`, `pg_restore`, `psql`) on your
+  `PATH`.
+- **A database user** that can read the databases you back up. To
+  restore, it also needs permission to create databases.
 
-  **Version compatibility:** `pg_dump` must be **at least as new as the
-  server** it backs up — it refuses to dump a newer server and fails with
-  `server version: X; pg_dump version: Y`. It *is* backward compatible, so
-  a newer client dumps older servers fine. When in doubt, install the
-  newest `pg_dump` you'll need across all your servers. (The Docker image
-  pins version 18 for exactly this reason — see
-  [docs/ugreen-nas.md](docs/ugreen-nas.md).)
+**Version rule:** `pg_dump` must be **the same version as the server or
+newer**. An older `pg_dump` refuses to back up a newer server
+(`server version: X; pg_dump version: Y`). When in doubt, install the
+newest version.
 
-  Check whether you already have them:
+Check what you have:
 
-  ```sh
-  # prints version if installed, "command not found" if not
-  pg_dump --version && pg_restore --version && psql --version
-  ```
+```sh
+pg_dump --version && pg_restore --version && psql --version
+```
 
-  If that fails, install them:
+Install them if needed:
 
-  **macOS (Homebrew)**
-
-  ```sh
-  # installs the client tools (libpq includes pg_dump/pg_restore/psql)
-  brew install libpq
-  # libpq is keg-only by default; this puts pg_dump/pg_restore/psql on PATH
-  brew link --force libpq
-  ```
-
-  **Linux (Debian/Ubuntu)**
-
-  ```sh
-  # refreshes package lists, then installs the client tools
-  sudo apt-get update && sudo apt-get install -y postgresql-client
-  ```
-
-  **Linux (Fedora/RHEL/CentOS)**
-
-  ```sh
-  # installs the client tools (pulls in pg_dump/pg_restore/psql)
-  sudo dnf install -y postgresql
-  ```
-
-  **Linux (Arch)**
-
-  ```sh
-  # installs the client tools (pulls in pg_dump/pg_restore/psql)
-  sudo pacman -S postgresql-libs
-  ```
-
-  **UGREEN NAS (UGOS)**
-
-  UGOS doesn't have a standard package manager — see
-  [docs/ugreen-nas.md](docs/ugreen-nas.md) for a Docker-based setup.
+| System | Command |
+|---|---|
+| macOS (Homebrew) | `brew install libpq && brew link --force libpq` |
+| Debian / Ubuntu | `sudo apt-get update && sudo apt-get install -y postgresql-client` |
+| Fedora / RHEL / CentOS | `sudo dnf install -y postgresql` |
+| Arch | `sudo pacman -S postgresql-libs` |
+| UGREEN NAS (UGOS) | No package manager, so use Docker. See [docs/ugreen-nas.md](docs/ugreen-nas.md). |
 
 ## Build
 
 ```sh
-# compiles the CLI into ./bin/dbsnap
 go build -o bin/dbsnap ./cmd/dbsnap
 ```
 
-This produces a `dbsnap` binary under `bin/`. Everything below assumes
-you run it as `./bin/dbsnap` (or put it on your `PATH`).
+The examples below run it as `./bin/dbsnap`.
 
-## Quick start: backing up
+## Connecting
 
-dbsnap needs the database password before it can connect — set it via
-`DBSNAP_PASSWORD` (preferred, keeps it out of shell history/`ps`) or pass
-`-password` directly:
+Both commands take the same connection flags: `-host` (default
+`localhost`), `-port` (default `5432`), `-user` (required) and the
+password.
 
-```sh
-# sets the password for this shell session
-export DBSNAP_PASSWORD=secret
-
-# backs up database "appdb" on localhost, connecting as user "postgres";
-# picks up DBSNAP_PASSWORD automatically, no -password flag needed
-./bin/dbsnap backup -host localhost -user postgres -db appdb
-```
-
-Backups are written to `./backups` by default — pass `-out <dir>` to
-change it.
-
-You'll be prompted for nothing further on the command line — instead, on
-a terminal, dbsnap walks through an interactive flow:
-
-1. **Connect** — verifies the host/credentials are reachable.
-2. **Discover** — checks which of the databases you asked for actually
-   exist, and reports any that don't.
-3. **Inspect** — for each database found, lists every schema and table
-   with an exact row count (`SELECT count(*)` per table — accurate, but
-   it's a full scan, so this step can take a while on large tables).
-4. **Confirm** — shows the full report and asks `Continue with backup?
-   [y/N]` before touching anything.
-5. **Backup** — runs `pg_dump` per database, showing which table is
-   currently being dumped as it goes.
-6. **Summary** — a final schema/table breakdown of rows found vs. rows
-   backed up, plus totals.
-
-### Backing up several databases at once
+Set the password as an environment variable, so it stays out of your
+shell history:
 
 ```sh
-# backs up 3 databases, at most 3 pg_dump processes running at once
-./bin/dbsnap backup -user postgres -db appdb,billingdb,analyticsdb -concurrency 3
+export DBSNAP_PASSWORD='your-password'
 ```
 
-Each named database gets backed up independently (own `pg_dump` process),
-up to `-concurrency` running in parallel. If some of the names don't
-exist on the server, dbsnap still proceeds with the ones that do — it
-only refuses to continue if *none* of them are found.
+You can also pass `-password`, but the password then shows up in your
+shell history.
 
-### Skipping the confirmation prompt
-
-For scripted-but-still-interactive runs (you still want to see the
-report and progress, just not be asked to press `y`):
+## Backing up
 
 ```sh
-# runs the full report + progress UI, but proceeds without asking y/n
-./bin/dbsnap backup -user postgres -db appdb -yes
+./bin/dbsnap backup -user postgres -db appdb
 ```
 
-### Non-interactive / cron use
+This writes `./backups/appdb_<date>T<time>.dump`. Use `-out <dir>` to
+choose another folder.
 
-When stdout isn't a terminal (e.g. running under cron, or piped to a
-file), dbsnap automatically skips the interactive flow and falls back to
-plain line-per-database output — no flags needed. You can also force this
-on a real terminal with `-non-interactive`:
+On a terminal, dbsnap first shows what it found (every schema and table,
+with row counts) and asks `Continue with backup? [y/N]`. After the backup,
+it prints a summary.
+
+**Several databases at once:**
 
 ```sh
-# forces plain OK/FAIL output instead of the interactive flow
-./bin/dbsnap backup -user postgres -db appdb,billingdb -non-interactive
+./bin/dbsnap backup -user postgres -db appdb,billingdb,analyticsdb
 ```
 
+Up to 3 run in parallel (change with `-concurrency`). On a terminal, names
+that don't exist are reported and skipped, and dbsnap stops only if none
+of them exist. In plain output, each missing name shows up as a `FAIL`
+line.
+
+**Scripts and cron:** when the output isn't a terminal, or with
+`-non-interactive`, dbsnap skips the questions and prints one line per
+database:
+
 ```
-# one line per database: OK with size/duration/path, or FAIL with the error
-OK   appdb                             1048576 bytes      812ms  -> ./backups/appdb_20260721T101500.dump
-FAIL billingdb                         connection refused
+OK   appdb       1048576 bytes   812ms  -> ./backups/appdb_20260721T101500.dump
+FAIL billingdb   connection refused
 ```
 
-Exit code is non-zero if any database failed to back up.
+The exit code is non-zero if any backup failed. To keep the interactive
+screens but skip the question, use `-yes`.
 
 ### Backup flags
 
-| Flag           | Default      | Meaning                                                                 |
-|----------------|--------------|--------------------------------------------------------------------------|
-| `-provider`    | `postgres`   | Which engine to use.                                                    |
-| `-host`        | `localhost`  | Database host.                                                          |
-| `-port`        | provider default (5432 for postgres) | Database port.                                  |
-| `-user`        | *(required)* | Database user.                                                          |
-| `-password`    | `$DBSNAP_PASSWORD` | Database password.                                                 |
-| `-db`          | *(required)* | Comma-separated database names to back up.                              |
-| `-out`         | `./backups`  | Directory to write backup files to.                                     |
-| `-format`      | provider default (`custom` for postgres) | Backup format — postgres supports `custom`, `plain`, `directory`, `tar`. |
-| `-concurrency` | `3`          | How many databases to back up in parallel.                              |
-| `-yes`         | `false`      | Skip the confirmation prompt.                                           |
-| `-non-interactive` | `false`  | Force plain output even on a terminal.                                  |
+| Flag | Default | Meaning |
+|---|---|---|
+| `-db` | *(required)* | Databases to back up, comma-separated. |
+| `-out` | `./backups` | Folder for the backup files. |
+| `-format` | `custom` | `custom` (compressed, recommended), `plain` (`.sql` text), `directory` or `tar`. |
+| `-concurrency` | `3` | How many databases to back up at the same time. |
+| `-yes` | off | Don't ask for confirmation. |
+| `-non-interactive` | off | Plain one-line output, even on a terminal. |
+| `-host`, `-port`, `-user`, `-password`, `-provider` | | See [Connecting](#connecting). `-provider` is `postgres`, the only one available. |
 
 ## Restoring
 
-Restore takes one or more `dbname=path` pairs — each target database
-needs its own source file, since (unlike backup) there's no way to infer
-where each database's data should come from.
+**A restore always creates a new database.** dbsnap never writes into a
+database that already exists, even an empty one, so an existing database
+can't be overwritten by accident.
 
 ```sh
-# restores that one file into database "appdb" on localhost, as user "postgres"
-./bin/dbsnap restore -host localhost -user postgres \
-  -db "appdb=./backups/appdb_20260721T101500.dump"
+# creates "appdb" (the name stored in the backup)
+./bin/dbsnap restore -user postgres ./backups/appdb_20260721T101500.dump
+
+# creates "appdb_restore" instead
+./bin/dbsnap restore -user postgres -db appdb_restore ./backups/appdb_20260721T101500.dump
 ```
 
-Several at once:
+Pass one backup file per command. Flags can go before or after the file.
+
+### How the new database is named
+
+1. The name you pass with **`-db`**.
+2. Otherwise, **the name stored inside the backup**. `custom`, `tar` and
+   `directory` backups store it.
+3. Otherwise, dbsnap stops and asks for `-db`. `.sql` backups don't store
+   a name.
+
+dbsnap never takes the name from the file name.
+
+### If the name is already taken
+
+dbsnap stops before changing anything and suggests a free name, as a
+command you can copy:
+
+```
+Database "appdb" (name taken from the backup) already exists on localhost — nothing was restored.
+dbsnap only restores into a new database it creates itself. Choose another name with -db, e.g.:
+  ./bin/dbsnap restore -user postgres -db appdb_restore_20260922 ./backups/appdb_20260721T101500.dump
+```
+
+### Replacing a database safely
+
+Restore under a new name, check the data, then swap the names:
 
 ```sh
-# restores two databases in parallel, each from its own backup file
-./bin/dbsnap restore -host localhost -user postgres \
-  -db "appdb=./backups/appdb_20260721T101500.dump,billingdb=./backups/billingdb_20260721T101500.dump" \
-  -concurrency 2
+./bin/dbsnap restore -user postgres -db appdb_restore ./backups/appdb_20260721T101500.dump
 ```
 
-If a target database already exists, dbsnap restores into it as-is —
-conflicting objects will error. There's deliberately no option to drop
-existing objects first; if you want a clean slate, drop the database
-yourself first (a conscious, hard-to-do-by-accident action), then
-restore — since it no longer exists, dbsnap creates it itself under
-exactly the name you asked for (using server default encoding/owner/
-collation) before restoring into it. That target name doesn't have to
-match the database the backup originally came from — restoring
-`appdb=./backups/appdb_....dump` as `-db "appdb_staging=..."` creates
-`appdb_staging`, not `appdb`. If the backup's original name is on record
-(archive formats only) and differs from your target, the report just
-notes it for context; it never blocks the restore.
+```sql
+-- run while connected to another database, e.g. "postgres"
+ALTER DATABASE appdb RENAME TO appdb_old;
+ALTER DATABASE appdb_restore RENAME TO appdb;
+```
+
+Postgres refuses to rename a database while anyone is connected to it, so
+stop your app first. Keep `appdb_old` until you're sure, then delete it
+with `DROP DATABASE appdb_old;`.
+
+For a **test copy**, skip the rename: restore under a new name, use it,
+and `DROP DATABASE` it when you're done.
+
+### What you'll see
+
+On a terminal, dbsnap shows the server, the database it will create and
+the backup file, then asks `Continue with restore? [y/N]`. After the
+restore, it counts the rows in the new database so you can check the
+result. `-yes` skips the question. `-non-interactive` (or no terminal)
+prints a single `OK` or `FAIL` line.
+
+- **Warnings:** sometimes a single statement fails and is skipped while
+  the rest restores fine. Usually this is a setting the server doesn't
+  support (see [Notes](#notes)). dbsnap still reports success but lists
+  every skipped statement, marked ⚠ (or `WARN` in plain output). Read
+  them: occasionally they mean something wasn't restored.
+- **Failures:** if the restore fails partway, the new database stays
+  behind and may be incomplete. Drop it before trying again.
+- **"role does not exist" errors:** the backup records which user owns
+  each table. If that user doesn't exist on this server, add `-no-owner`
+  and your user will own everything instead.
 
 ### Restore flags
 
-| Flag           | Default      | Meaning                                                                 |
-|----------------|--------------|--------------------------------------------------------------------------|
-| `-provider`    | `postgres`   | Which engine to use.                                                    |
-| `-host`        | `localhost`  | Database host.                                                          |
-| `-port`        | provider default | Database port.                                                      |
-| `-user`        | *(required)* | Database user.                                                          |
-| `-password`    | `$DBSNAP_PASSWORD` | Database password.                                                 |
-| `-db`          | *(required)* | Comma-separated `dbname=path` pairs to restore.                         |
-| `-format`      | inferred per file | Force a format instead of inferring it from the file/directory.    |
-| `-no-owner`    | `false`      | Skip restoring ownership/ACLs — useful when the target role differs from the one that produced the backup. |
-| `-jobs`        | —            | Parallel restore jobs (postgres: only for `custom`/`directory` format dumps). |
-| `-concurrency` | `3`          | How many databases to restore in parallel.                              |
+| Flag | Default | Meaning |
+|---|---|---|
+| `-db` | name stored in the backup | Name of the new database. It must not exist yet. |
+| `-no-owner` | off | Don't restore the original owners and permissions. Everything belongs to `-user`. |
+| `-format` | detected from the file | Set the backup format when detection gets it wrong. |
+| `-jobs` | | Restore with several parallel workers (faster for large `custom` or `directory` backups). |
+| `-yes` | off | Don't ask for confirmation. |
+| `-non-interactive` | off | Plain one-line output, even on a terminal. |
+| `-host`, `-port`, `-user`, `-password`, `-provider` | | See [Connecting](#connecting). |
 
-## Notes and caveats
+## Notes
 
-- **Row counts are exact, not free.** `-db` discovery runs `SELECT
-  count(*)` per table (a few at a time, bounded concurrency) to get exact
-  numbers. On databases with very large tables this adds real time before
-  the backup itself starts.
-- **The "rows backed up" figure is trusted from `pg_dump`'s exit code**,
-  not independently re-counted — `pg_dump` doesn't report row-level
-  progress, so a successful exit is taken to mean everything listed in
-  the pre-flight report was captured.
-- **Discovery requires connecting to a maintenance database** (default
-  `postgres`) to list what else exists on the server, since Postgres has
-  no "connect with no database" mode. Override it via a connection param
-  if your server doesn't have one (see `providers/postgres/inspect.go`).
+- **Restoring into an older Postgres version.** A backup made by a newer
+  `pg_dump` can contain settings an older server doesn't recognize. For
+  example, `pg_dump` 17+ writes `SET transaction_timeout = 0;`, which
+  Postgres 16 rejects. For `custom`, `tar` and `directory` backups, that
+  statement is skipped and shown as a warning. A `.sql` backup stops at
+  the first error, so the restore fails. Restoring into a server of the
+  same version or newer avoids this.
+- **Row counts take time.** Before a backup, and after a restore, dbsnap
+  counts every table's rows exactly (`SELECT count(*)`). On very large
+  tables this can take a while.
+- **The backup summary trusts `pg_dump`.** Row counts are taken before
+  the backup. If `pg_dump` finishes without errors, those rows are
+  assumed to be in the file. They aren't re-counted from the file.
+- **A `postgres` database must exist on the server.** dbsnap connects to
+  it to list databases and to create new ones. This can't be changed from
+  the command line yet.

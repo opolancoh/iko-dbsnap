@@ -96,15 +96,6 @@ type RestoreOptions struct {
 	// that produced the backup.
 	NoOwner bool
 
-	// Create asks the provider to create the target database itself
-	// before restoring into it, rather than requiring it to already
-	// exist. Only meaningful for providers/formats that record enough
-	// metadata to do this safely — see core.ArchiveInspector and
-	// core.DecideRestorePlan, which callers should use to decide when
-	// this is actually safe to set (the resulting database name is
-	// generally dictated by the archive, not by ConnectionInfo.DBName).
-	Create bool
-
 	Params map[string]string
 
 	// OnProgress, if set, is called by providers that can report
@@ -128,6 +119,14 @@ type RestoreResult struct {
 	StartedAt time.Time
 	Duration  time.Duration
 	Err       error
+
+	// Warnings holds errors the provider's restore tool reported but
+	// skipped past rather than aborting on (e.g. pg_restore's "errors
+	// ignored on restore"). The restore still counts as OK — typically
+	// these are settings the target server's version doesn't recognize —
+	// but callers must surface them, since they can also mean an object
+	// was not restored.
+	Warnings []string
 }
 
 // OK reports whether the restore completed without error.

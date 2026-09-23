@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os/exec"
@@ -10,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"iko-dbsnap/core"
@@ -25,6 +27,10 @@ const DefaultMaintenanceDB = "postgres"
 // while inspecting a single database, so a database with hundreds of
 // tables doesn't open hundreds of simultaneous connections.
 const maxInspectConcurrency = 4
+
+// duplicateDatabaseCode is the SQLSTATE CREATE DATABASE fails with when
+// the name is already taken.
+const duplicateDatabaseCode = "42P04"
 
 func maintenanceDB(conn core.ConnectionInfo) string {
 	return conn.Param("maintenanceDB", DefaultMaintenanceDB)
@@ -70,12 +76,13 @@ func (p *Provider) Ping(ctx context.Context, conn core.ConnectionInfo) error {
 }
 
 // CreateDatabase creates a new, empty database named conn.DBName, using
-// server defaults for encoding/owner/collation. Used by Restore when
-// asked to create the target database itself — deliberately implemented
-// as a plain CREATE DATABASE rather than delegating to `pg_restore
-// --create`, since that always names the database after whatever the
-// archive was originally dumped from, not whatever name was requested
-// here.
+// server defaults for encoding/owner/collation. Used by Restore, which
+// always creates its target — deliberately implemented as a plain CREATE
+// DATABASE rather than delegating to `pg_restore --create`, since that
+// always names the database after whatever the archive was originally
+// dumped from, not whatever name was requested here. It fails if the
+// database already exists, which is what keeps Restore from ever writing
+// into an existing database.
 func (p *Provider) CreateDatabase(ctx context.Context, conn core.ConnectionInfo) error {
 	c, err := pgx.Connect(ctx, connString(conn, maintenanceDB(conn)))
 	if err != nil {
@@ -85,6 +92,10 @@ func (p *Provider) CreateDatabase(ctx context.Context, conn core.ConnectionInfo)
 
 	ident := pgx.Identifier{conn.DBName}.Sanitize()
 	if _, err := c.Exec(ctx, "CREATE DATABASE "+ident); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == duplicateDatabaseCode {
+			return fmt.Errorf("postgres: database %q already exists — dbsnap only restores into a database it creates itself", conn.DBName)
+		}
 		return fmt.Errorf("postgres: creating database %q: %w", conn.DBName, err)
 	}
 	return nil

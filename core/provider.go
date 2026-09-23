@@ -16,11 +16,11 @@ type Provider interface {
 	// opts.OutputDir and reports where it landed.
 	Backup(ctx context.Context, conn ConnectionInfo, opts BackupOptions) (BackupResult, error)
 
-	// Restore loads a backup artifact (opts.InputPath, as produced by
-	// Backup) into the database described by conn. If that database
-	// doesn't exist, opts.Create controls whether it's created first (see
-	// core.DecideRestorePlan for when that's safe to set). Restoring into
-	// an existing, non-empty database may fail on conflicting objects —
-	// there's deliberately no option to drop existing objects first.
+	// Restore creates the database named by conn.DBName and loads a
+	// backup artifact (opts.InputPath, as produced by Backup) into it. It
+	// must fail without touching anything if that database already
+	// exists — dbsnap only ever restores into a database it just created
+	// itself, never into an existing one (empty or not). See PlanRestore
+	// for the friendlier pre-flight version of that check.
 	Restore(ctx context.Context, conn ConnectionInfo, opts RestoreOptions) (RestoreResult, error)
 }

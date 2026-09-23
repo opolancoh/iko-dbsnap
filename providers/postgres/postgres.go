@@ -208,14 +208,18 @@ func runWithProgress(cmd *exec.Cmd, onLine func(line string)) (stderr string, er
 	return buf.String(), runErr
 }
 
-// Restore loads a backup produced by Backup into a database, creating it
-// first under the exact name given by conn.DBName if opts.Create is set
-// (see core.DecideRestorePlan) — via a plain CREATE DATABASE, not
-// pg_restore's own --create, so the result is always named what was
-// asked for rather than whatever the archive was originally dumped from.
-// Plain-format dumps (a .sql file, or any dump with Format explicitly set
-// to "plain") are executed via psql; every other format is handed to
-// pg_restore, which auto-detects custom/tar/directory archives itself.
+// Restore creates a new database named exactly conn.DBName and loads a
+// backup produced by Backup into it. Creation goes through a plain CREATE
+// DATABASE, not pg_restore's own --create, so the result is always named
+// what was asked for rather than whatever the archive was originally
+// dumped from — and since CREATE DATABASE fails if the name is taken, an
+// existing database is never restored into. Plain-format dumps (a .sql
+// file, or any dump with Format explicitly set to "plain") are executed
+// via psql; every other format is handed to pg_restore, which
+// auto-detects custom/tar/directory archives itself. If pg_restore only
+// skipped individual failing statements ("errors ignored on restore"),
+// the restore counts as OK and those errors come back as
+// RestoreResult.Warnings.
 //
 // Recognized opts.Params keys:
 //   - "jobs": passed as pg_restore -j (parallel restore; only valid for
@@ -229,6 +233,9 @@ func (p *Provider) Restore(ctx context.Context, conn core.ConnectionInfo, opts c
 
 	if conn.DBName == "" {
 		return res, fmt.Errorf("postgres: DBName is required")
+	}
+	if len(conn.DBName) > maxIdentifierLen {
+		return res, fmt.Errorf("postgres: database name %q is longer than %d bytes, which Postgres would silently truncate", conn.DBName, maxIdentifierLen)
 	}
 	if conn.User == "" {
 		return res, fmt.Errorf("postgres: User is required")
@@ -247,12 +254,6 @@ func (p *Provider) Restore(ctx context.Context, conn core.ConnectionInfo, opts c
 	format, err := resolveRestoreFormat(opts.Format, opts.InputPath)
 	if err != nil {
 		return res, err
-	}
-
-	if opts.Create {
-		if err := p.CreateDatabase(ctx, conn); err != nil {
-			return res, err
-		}
 	}
 
 	var cmd *exec.Cmd
@@ -285,6 +286,10 @@ func (p *Provider) Restore(ctx context.Context, conn core.ConnectionInfo, opts c
 	}
 	cmd.Env = connEnv(conn)
 
+	if err := p.CreateDatabase(ctx, conn); err != nil {
+		return res, err
+	}
+
 	stderr, runErr := runWithProgress(cmd, func(line string) {
 		if opts.OnProgress == nil {
 			return
@@ -295,9 +300,46 @@ func (p *Provider) Restore(ctx context.Context, conn core.ConnectionInfo, opts c
 	})
 	res.Duration = time.Since(start)
 	if runErr != nil {
-		return res, fmt.Errorf("postgres: restore failed for %q: %w: %s", conn.DBName, runErr, stderr)
+		if warnings, ok := parseIgnoredErrors(stderr); ok && format != FormatPlain {
+			res.Warnings = warnings
+			return res, nil
+		}
+		return res, fmt.Errorf("postgres: restore failed for %q (the database was created and may be partially restored — drop it before retrying): %w: %s", conn.DBName, runErr, stderr)
 	}
 	return res, nil
+}
+
+// maxIdentifierLen is Postgres's default NAMEDATALEN-1: longer database
+// names are truncated (with only a NOTICE), which would leave the restore
+// under a different name than the one asked for.
+const maxIdentifierLen = 63
+
+// ignoredErrorsRe matches the summary pg_restore prints when it finished
+// the whole archive but skipped statements that failed, e.g.:
+//
+//	pg_restore: warning: errors ignored on restore: 1
+var ignoredErrorsRe = regexp.MustCompile(`errors ignored on restore: \d+`)
+
+// parseIgnoredErrors reports whether pg_restore's stderr ends in an
+// "errors ignored on restore" summary — meaning it ran to completion and
+// only skipped individual failing statements — and if so returns each
+// skipped error, with the statement that caused it when pg_restore shows
+// one. Anything else (no summary) is a real failure, not a warning.
+func parseIgnoredErrors(stderr string) ([]string, bool) {
+	if !ignoredErrorsRe.MatchString(stderr) {
+		return nil, false
+	}
+	var warnings []string
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "pg_restore: error: "):
+			warnings = append(warnings, strings.TrimPrefix(line, "pg_restore: error: "))
+		case strings.HasPrefix(line, "Command was: ") && len(warnings) > 0:
+			warnings[len(warnings)-1] += " (" + line + ")"
+		}
+	}
+	return warnings, true
 }
 
 // processingTableRe matches pg_restore -v's per-table data-loading
